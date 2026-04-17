@@ -1,0 +1,8 @@
+torch>=2.4
+coremltools>=9.0
+transformers>=4.44
+numpy
+soundfile
+accelerate
+diffusers
+huggingface_hub

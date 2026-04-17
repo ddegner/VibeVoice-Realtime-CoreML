@@ -1,0 +1,15 @@
+conversion/third_party/
+conversion/out/
+conversion/.venv/
+conversion/**/__pycache__/
+conversion/**/*.pyc
+swift/.build/
+swift/.swiftpm/
+swift/Package.resolved
+.DS_Store
+*.mlpackage
+*.mlmodelc
+*.wav
+!swift/Tests/**/*.wav
+out/
+.claude/
