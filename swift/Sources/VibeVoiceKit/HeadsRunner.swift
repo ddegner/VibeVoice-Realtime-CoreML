@@ -20,13 +20,21 @@ public final class HeadsRunner: @unchecked Sendable {
     public let eos: MLModel
     public let constants: SpeechConstants
 
-    public init(modelsDir: URL, config: MLModelConfiguration) async throws {
+    public convenience init(modelsDir: URL, config: MLModelConfiguration) async throws {
+        try await self.init(modelsDir: modelsDir, connectorConfig: config, eosConfig: config)
+    }
+
+    public init(
+        modelsDir: URL,
+        connectorConfig: MLModelConfiguration,
+        eosConfig: MLModelConfiguration
+    ) async throws {
         self.connector = try await ModelLoader.load(
             packageURL: modelsDir.appendingPathComponent("acoustic_connector.mlpackage"),
-            configuration: config)
+            configuration: connectorConfig)
         self.eos = try await ModelLoader.load(
             packageURL: modelsDir.appendingPathComponent("tts_eos_classifier.mlpackage"),
-            configuration: config)
+            configuration: eosConfig)
 
         let constURL = modelsDir.appendingPathComponent("speech_constants.json")
         let data = try Data(contentsOf: constURL)
@@ -74,6 +82,19 @@ public final class HeadsRunner: @unchecked Sendable {
                           userInfo: [NSLocalizedDescriptionKey: "eos missing output"])
         }
         return p.dataPointer.assumingMemoryBound(to: Float.self)[0]
+    }
+
+    /// Run a zero-input prediction through both heads to amortize first-call
+    /// CoreML compile/plan cost off the synthesis critical path. Single-frame
+    /// inputs match the runtime decode shape used by `project` / `eosProbability`.
+    public func warmup() async throws {
+        let latent = try MLMultiArray(shape: [1, 1, 64], dataType: .float32)
+        memset(latent.dataPointer, 0, latent.count * MemoryLayout<Float>.size)
+        let hidden = try MLMultiArray(shape: [1, 896], dataType: .float32)
+        memset(hidden.dataPointer, 0, hidden.count * MemoryLayout<Float>.size)
+        async let p = project(latent: latent)
+        async let e = eosProbability(hidden: hidden)
+        _ = try await (p, e)
     }
 
     /// Apply `scaled = latent / scale - bias` element-wise in place of the raw

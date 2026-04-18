@@ -192,63 +192,6 @@ public final class DiffusionRunner: @unchecked Sendable {
         return sample
     }
 
-    /// Denoise a batch (e.g. 16-frame chunk) — same algorithm.
-    public func denoise(conditioning: LLMRunner.Output) async throws -> MLMultiArray {
-        guard let rawCond = conditioning.hiddenStates.first else {
-            throw NSError(domain: "VibeVoiceKit.DiffusionRunner", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "no conditioning"])
-        }
-        let cond = try adaptConditioning(rawCond)
-        let uncond = try zerosLike(cond)
-
-        var sample = try randomNormal(shape: [1, Self.T, Self.D] as [NSNumber])
-        let tPtr = reusableTimestep.dataPointer.assumingMemoryBound(to: Float.self)
-        var prevX0: MLMultiArray? = nil
-        var orderUsed = 0
-
-        for i in 0..<steps {
-            let entry = schedule[i]
-            tPtr[0] = Float(entry.timestep)
-            let sampleIn = sample
-            async let vCondTask = predict(latent: sampleIn, t: reusableTimestep, cond: cond)
-            async let vUncondTask = predict(latent: sampleIn, t: reusableTimestep, cond: uncond)
-            let (vCond, vUncond) = try await (vCondTask, vUncondTask)
-            let v = try cfgBlend(uncond: vUncond, cond: vCond, scale: guidance)
-            let x0 = try vPredToX0(sample: sample, v: v, alphaT: entry.alphaT, sigmaT: entry.sigmaT)
-
-            let targetAlpha: Double, targetSigma: Double, targetLambda: Double
-            if i + 1 < steps {
-                targetAlpha = schedule[i + 1].alphaT
-                targetSigma = schedule[i + 1].sigmaT
-                targetLambda = schedule[i + 1].lambdaT
-            } else {
-                targetAlpha = finalAlpha; targetSigma = finalSigma; targetLambda = .infinity
-            }
-
-            let thisOrder = (i == 0 || i == steps - 1) ? 1 : min(2, orderUsed + 1)
-            if thisOrder == 1 {
-                let h = targetLambda - entry.lambdaT
-                sample = try dpmSolverFirstOrder(
-                    sample: sample, x0: x0,
-                    sigmaS: entry.sigmaT, alphaT: targetAlpha, sigmaT: targetSigma, h: h)
-            } else {
-                let h = targetLambda - entry.lambdaT
-                let r0 = (entry.lambdaT - schedule[i - 1].lambdaT) / h
-                guard let prev = prevX0 else {
-                    throw NSError(domain: "VibeVoiceKit.DiffusionRunner", code: 3, userInfo: [
-                        NSLocalizedDescriptionKey: "order-2 step at i=\(i) without prevX0 — order progression invariant violated"
-                    ])
-                }
-                sample = try dpmSolverSecondOrder(
-                    sample: sample, x0: x0, prevX0: prev,
-                    sigmaS: entry.sigmaT, alphaT: targetAlpha, sigmaT: targetSigma,
-                    h: h, r0: r0)
-            }
-            prevX0 = x0; orderUsed = thisOrder
-        }
-        return sample
-    }
-
     // MARK: - DPM-Solver++ step functions
 
     /// First-order DPM-Solver++ update:
@@ -358,28 +301,6 @@ public final class DiffusionRunner: @unchecked Sendable {
         precondition(a.shape.map(\.intValue) == [1, H], "unexpected cond shape \(a.shape)")
         let out = try MLMultiArray(shape: [1, 1, NSNumber(value: H)], dataType: .float32)
         memcpy(out.dataPointer, a.dataPointer, H * MemoryLayout<Float>.size)
-        return out
-    }
-
-    private func adaptConditioning(_ lm: MLMultiArray) throws -> MLMultiArray {
-        let want: [NSNumber] = [1, NSNumber(value: Self.T), NSNumber(value: Self.H)]
-        if lm.shape.map(\.intValue) == want.map(\.intValue) { return lm }
-        let out = try MLMultiArray(shape: want, dataType: .float32)
-        let srcT = lm.shape[1].intValue
-        let offset = max(0, srcT - Self.T)
-        let src = lm.dataPointer.assumingMemoryBound(to: Float.self)
-        let dst = out.dataPointer.assumingMemoryBound(to: Float.self)
-        for t in 0..<min(Self.T, srcT) {
-            let srcRow = (offset + t) * Self.H
-            let dstRow = t * Self.H
-            for h in 0..<Self.H { dst[dstRow + h] = src[srcRow + h] }
-        }
-        return out
-    }
-
-    private func zerosLike(_ a: MLMultiArray) throws -> MLMultiArray {
-        let out = try MLMultiArray(shape: a.shape, dataType: .float32)
-        memset(out.dataPointer, 0, a.count * MemoryLayout<Float>.size)
         return out
     }
 

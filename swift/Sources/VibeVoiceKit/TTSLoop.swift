@@ -24,16 +24,36 @@ import CoreML
 ///   5. VAE decode in 16-frame windows.
 public final class TTSLoop: @unchecked Sendable {
     public struct Config {
-        public var maxFrames: Int = 200       // ~26.6s ceiling
+        /// Hard ceiling on speech frames per `generate` call. Each frame is
+        /// 3200 audio samples (≈133ms @ 24 kHz), so 1500 ≈ 200s ≈ 3.3 min.
+        /// The 0.5B model card advertises up to ~10 min of continuous output;
+        /// 1500 leaves headroom for that without committing the runtime to
+        /// arbitrarily long generations on accidental input. Override per call
+        /// via `Config.maxFrames` for shorter (interactive) or longer (batch
+        /// audiobook chunk) limits. EOS normally fires well before this cap.
+        public var maxFrames: Int = 1500
         public var eosThreshold: Float = 0.5
         public var textWindowSize: Int = 5
         public var speechWindowSize: Int = 6
+        /// Extra speech frames generated after the EOS classifier fires, before
+        /// stopping. The classifier is a lagging indicator — when it fires on
+        /// a sharp rise (prev ~0.01 → curr > 0.5), the last 1–3 frames often
+        /// contain a truncated word onset, causing the "clipped last letter"
+        /// artifact at chunk boundaries. Continuing for N more frames lets the
+        /// model finish the in-flight phoneme. Each frame is ~133 ms, so the
+        /// default N=2 adds ~266 ms of tail per clip. Set to 0 to disable.
+        /// During the safety window, no further EOS checks are made — we
+        /// commit to N frames then stop unconditionally.
+        public var postEOSSafetyFrames: Int = 2
         /// Latent frames of left-context the VAE is fed at each sliding-window
-        /// decode. Because the acoustic decoder is fully **causal** with a
-        /// stem receptive field of 6 latent frames (kernel=7), L≥7 makes the
-        /// output for the "new" portion numerically identical to the upstream
-        /// streaming path. L=8 gives a comfortable margin and a clean 50/50
-        /// split with T=16, at the cost of 2× VAE calls (~0.14s each on GPU).
+        /// decode. The acoustic decoder's stem has a 6-frame receptive field
+        /// (kernel=7), so L=6 is theoretically bit-identical to upstream — but
+        /// downstream layers extend the effective receptive field, and a
+        /// bisect against the bench harness showed L=6 produced ~45 extra
+        /// glitch-windows and a small peak shift on a 168s clip. L=8 stays
+        /// bit-identical at the cost of one extra VAE call per stride; the
+        /// raw VAE time is dominated by first-call compilation anyway, which
+        /// is now hidden by `Config.warmupAtInit`.
         public var vaeLeftContext: Int = 8
         /// Diagnostic: print one line per speech frame with the EOS classifier
         /// probability. Use to investigate clip-boundary artifacts (a sharp
@@ -127,9 +147,16 @@ public final class TTSLoop: @unchecked Sendable {
         var negV = voicePrompt.negTTSLM.vCache
         var negPos = Int32(voicePrompt.negTTSLM.length)
 
-        // Last hidden from TTS LM voice prompt
-        var posLast = try lastPosition(of: voicePrompt.ttsLM.hidden)
-        var negLast = try lastPosition(of: voicePrompt.negTTSLM.hidden)
+        // Last hidden from TTS LM voice prompt. Pooled (1,896) buffers reused
+        // across all subsequent updates — saves ~3000 throwaway allocations
+        // per generation (one per text token + two per speech frame). Reuse
+        // is safe because every write happens AFTER the awaited prediction
+        // that was reading the buffer; the pos/neg async-let pair each have
+        // their own dedicated buffer.
+        let posLast = try MLMultiArray(shape: [1, 896], dataType: .float32)
+        let negLast = try MLMultiArray(shape: [1, 896], dataType: .float32)
+        try lastPositionInto(voicePrompt.ttsLM.hidden,    dest: posLast)
+        try lastPositionInto(voicePrompt.negTTSLM.hidden, dest: negLast)
 
         var audio: [Float] = []
         // Full history of generated latent frames. We slide a 16-frame VAE
@@ -141,6 +168,10 @@ public final class TTSLoop: @unchecked Sendable {
         let stride = max(1, DiffusionRunner.T - config.vaeLeftContext)
         var totalSpeechFrames = 0
         var finished = false
+        // Tracks post-EOS safety-frame extension. `nil` means EOS hasn't fired
+        // yet; once it fires, this holds the remaining frame count (we still
+        // generate N more frames to avoid clipping a trailing phoneme).
+        var postEOSBudget: Int? = nil
 
         // ---- Interleaved text/speech windows ----
         var textOffset = 0
@@ -175,7 +206,7 @@ public final class TTSLoop: @unchecked Sendable {
                         kCache: posK, vCache: posV, positionID: posPos)
                     timing.ttsLMDecode += CFAbsoluteTimeGetCurrent() - t0
                     posK = posStep.k; posV = posStep.v
-                    posLast = try lastPosition(of: posStep.hidden)
+                    try lastPositionInto(posStep.hidden, dest: posLast)
                     posPos += 1
                 }
             }
@@ -201,13 +232,25 @@ public final class TTSLoop: @unchecked Sendable {
                 while shouldDecodeNext(decoded: decodedFrames,
                                        total: allLatents.count,
                                        stride: stride) {
-                    let t0 = CFAbsoluteTimeGetCurrent()
-                    try await decodeSliding(
+                    let T = DiffusionRunner.T
+                    let L = config.vaeLeftContext
+                    let windowStart: Int
+                    let framesToEmit: Int
+                    if decodedFrames == 0 {
+                        windowStart = 0
+                        framesToEmit = T
+                    } else {
+                        windowStart = decodedFrames - L
+                        framesToEmit = T - L
+                    }
+                    let tVae = CFAbsoluteTimeGetCurrent()
+                    _ = try await decodeWindow(
                         allLatents: allLatents,
-                        leftContext: config.vaeLeftContext,
+                        windowStart: windowStart,
+                        framesToEmit: framesToEmit,
                         decodedFrames: &decodedFrames,
                         appendTo: &audio)
-                    timing.vaeDecode += CFAbsoluteTimeGetCurrent() - t0
+                    timing.vaeDecode += CFAbsoluteTimeGetCurrent() - tVae
                 }
 
                 // Project latent → LM hidden for feedback
@@ -230,33 +273,49 @@ public final class TTSLoop: @unchecked Sendable {
                 let posKIn = posK, posVIn = posV, posPosIn = posPos
                 let negKIn = negK, negVIn = negV, negPosIn = negPos
                 async let posTask = llm.ttsDecodeStep(
+                    branch: 0,
                     inputID: 1, lmHidden: acousticEmbed,
                     tailMask: 1.0, textMask: 0,
                     kCache: posKIn, vCache: posVIn, positionID: posPosIn)
                 async let negTask = llm.ttsDecodeStep(
+                    branch: 1,
                     inputID: 1, lmHidden: acousticEmbed,
                     tailMask: 1.0, textMask: 0,
                     kCache: negKIn, vCache: negVIn, positionID: negPosIn)
                 let (posStep, negStep) = try await (posTask, negTask)
                 posK = posStep.k; posV = posStep.v
-                posLast = try lastPosition(of: posStep.hidden)
+                try lastPositionInto(posStep.hidden, dest: posLast)
                 posPos += 1
                 negK = negStep.k; negV = negStep.v
-                negLast = try lastPosition(of: negStep.hidden)
+                try lastPositionInto(negStep.hidden, dest: negLast)
                 negPos += 1
                 timing.ttsLMDecode += CFAbsoluteTimeGetCurrent() - tTts
 
-                // EOS check
-                let tEos = CFAbsoluteTimeGetCurrent()
-                let eosProb = try await heads.eosProbability(hidden: posLast)
-                timing.eos += CFAbsoluteTimeGetCurrent() - tEos
-                if config.logEOSTrajectory {
-                    let fired = eosProb > config.eosThreshold ? " <-- EOS" : ""
-                    print(String(format: "  frame %3d: eos_prob = %.4f%@",
-                                 totalSpeechFrames - 1, eosProb, fired))
-                }
-                if eosProb > config.eosThreshold {
-                    finished = true; break
+                // EOS check. Skipped once we're burning through the post-EOS
+                // safety-frame budget — we've already decided to stop and are
+                // just extending the tail to avoid clipping a trailing phoneme.
+                if var remaining = postEOSBudget {
+                    remaining -= 1
+                    if remaining <= 0 {
+                        finished = true; break
+                    }
+                    postEOSBudget = remaining
+                } else {
+                    let tEos = CFAbsoluteTimeGetCurrent()
+                    let eosProb = try await heads.eosProbability(hidden: posLast)
+                    timing.eos += CFAbsoluteTimeGetCurrent() - tEos
+                    if config.logEOSTrajectory {
+                        let fired = eosProb > config.eosThreshold ? " <-- EOS" : ""
+                        print(String(format: "  frame %3d: eos_prob = %.4f%@",
+                                     totalSpeechFrames - 1, eosProb, fired))
+                    }
+                    if eosProb > config.eosThreshold {
+                        if config.postEOSSafetyFrames > 0 {
+                            postEOSBudget = config.postEOSSafetyFrames
+                        } else {
+                            finished = true; break
+                        }
+                    }
                 }
             }
 
@@ -377,16 +436,20 @@ public final class TTSLoop: @unchecked Sendable {
 
     // MARK: - helpers
 
-    private func lastPosition(of hidden: MLMultiArray) throws -> MLMultiArray {
+    /// Copy the last position vector (slot `T-1`, all 896 channels) of a
+    /// `(1, T, 896)` hidden tensor into the caller-supplied `(1, 896)`
+    /// destination buffer. Avoids allocating a fresh MLMultiArray on the
+    /// hot path — the destination is reused across all calls in `generate`.
+    private func lastPositionInto(_ hidden: MLMultiArray, dest: MLMultiArray) throws {
         let shape = hidden.shape.map(\.intValue)
         precondition(shape.count == 3 && shape[0] == 1 && shape[2] == 896,
                      "unexpected hidden shape \(shape)")
+        precondition(dest.shape.map(\.intValue) == [1, 896],
+                     "lastPositionInto dest must be (1, 896)")
         let T = shape[1]
-        let out = try MLMultiArray(shape: [1, 896], dataType: .float32)
         let src = hidden.dataPointer.assumingMemoryBound(to: Float.self)
-        let dst = out.dataPointer.assumingMemoryBound(to: Float.self)
+        let dst = dest.dataPointer.assumingMemoryBound(to: Float.self)
         memcpy(dst, src.advanced(by: (T - 1) * 896), 896 * MemoryLayout<Float>.size)
-        return out
     }
 
     // MARK: - VAE sliding-window decode

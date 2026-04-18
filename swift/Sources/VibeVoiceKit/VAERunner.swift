@@ -31,4 +31,12 @@ public final class VAERunner: @unchecked Sendable {
         }
         return samples
     }
+
+    /// Run a zero-input prediction through the VAE to amortize first-call
+    /// CoreML compile/plan cost off the synthesis critical path.
+    public func warmup() async throws {
+        let latents = try MLMultiArray(shape: [1, 64, 16], dataType: .float32)
+        memset(latents.dataPointer, 0, latents.count * MemoryLayout<Float>.size)
+        _ = try await decode(latents: latents)
+    }
 }

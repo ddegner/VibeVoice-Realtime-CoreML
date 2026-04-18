@@ -10,11 +10,28 @@ import CoreML
 ///   4. Diffusion per frame → acoustic latents.
 ///   5. VAE decoder → 24 kHz PCM.
 public final class VibeVoiceEngine {
+    /// Identifies a model so per-kind compute-unit overrides can target it.
+    public enum ModelKind: Sendable, Hashable {
+        case textLM        // text_lm_decode (LM, KV cache, dynamic shape)
+        case ttsLM         // tts_lm_decode (LM, KV cache, dynamic shape)
+        case diffusion     // diffusion_head (small fp16, fixed shape)
+        case vae           // vae_decoder (fixed shape T=16)
+        case connector     // acoustic_connector (tiny fp16, fixed shape)
+        case eos           // tts_eos_classifier (tiny fp16, fixed shape)
+    }
+
     public struct Config: Sendable {
         public var modelsDir: URL
         public var diffusionSteps: Int = 5
         public var guidanceScale: Float = 1.5
+        /// Default compute units for any model not present in `computeUnitsByKind`.
+        /// LMs need this — KV-cache shape changes per call so ANE can't compile
+        /// a single plan, and falls back to GPU anyway with extra dispatch cost.
         public var computeUnits: MLComputeUnits = .cpuAndGPU
+        /// Per-kind compute-unit overrides. Empty by default; populate to route
+        /// fixed-shape heads to `.cpuAndNeuralEngine` (or `.all`) so the GPU
+        /// stays free for the LMs on the critical path. Phase 3 sweep matrix.
+        public var computeUnitsByKind: [ModelKind: MLComputeUnits] = [:]
         /// Allow fp16 accumulation on the GPU for the LLM / VAE / heads.
         /// These models are robust to the extra rounding; matters only for
         /// ~5-10% throughput.
@@ -24,6 +41,21 @@ public final class VibeVoiceEngine {
         /// the acoustic connector and can cause word-repetition / stuttering
         /// at the 5-step count. Default `false` for quality.
         public var lowPrecisionAccumForDiffusion: Bool = false
+        /// Run a single zero-input prediction through the heads + VAE in
+        /// parallel right after model load, to absorb first-call CoreML
+        /// compile/plan latency off the synthesis critical path. The two
+        /// LM-decode models and the diffusion head are skipped because
+        /// their input shapes depend on the voice prompt / per-frame state.
+        public var warmupAtInit: Bool = true
+        /// Number of `tts_lm_decode` MLModel handles. The pos/neg CFG
+        /// branches alternate handles. Default 1.
+        ///
+        /// Phase 5 measurement (2025-04, M-series): setting this to 2 did
+        /// NOT improve wall time. The two branches already share the GPU,
+        /// and a second handle adds load (+6.85s on the 168s reference clip)
+        /// rather than unlocking concurrency. Audio remained bit-identical.
+        /// Kept as a knob in case future hardware changes the trade.
+        public var ttsHandles: Int = 1
         public init(modelsDir: URL) { self.modelsDir = modelsDir }
     }
 
@@ -37,29 +69,51 @@ public final class VibeVoiceEngine {
     public init(config: Config) async throws {
         self.config = config
 
-        // Shared fp16-accum config used for the robust models.
-        let fp16Config = MLModelConfiguration()
-        fp16Config.computeUnits = config.computeUnits
-        fp16Config.allowLowPrecisionAccumulationOnGPU = config.lowPrecisionAccumForLLMs
+        // Per-kind compute units: lookup honors `computeUnitsByKind` first,
+        // falls back to `config.computeUnits`. Builds one MLModelConfiguration
+        // per kind so heads can route to ANE while LMs stay on GPU.
+        func cfg(_ kind: ModelKind, lowPrecision: Bool) -> MLModelConfiguration {
+            let mc = MLModelConfiguration()
+            mc.computeUnits = config.computeUnitsByKind[kind] ?? config.computeUnits
+            mc.allowLowPrecisionAccumulationOnGPU = lowPrecision
+            return mc
+        }
 
-        // Dedicated config for the diffusion head (quality-sensitive).
-        let diffConfig = MLModelConfiguration()
-        diffConfig.computeUnits = config.computeUnits
-        diffConfig.allowLowPrecisionAccumulationOnGPU = config.lowPrecisionAccumForDiffusion
+        let textCfg      = cfg(.textLM,    lowPrecision: config.lowPrecisionAccumForLLMs)
+        let ttsCfg       = cfg(.ttsLM,     lowPrecision: config.lowPrecisionAccumForLLMs)
+        let diffCfg      = cfg(.diffusion, lowPrecision: config.lowPrecisionAccumForDiffusion)
+        let vaeCfg       = cfg(.vae,       lowPrecision: config.lowPrecisionAccumForLLMs)
+        let connectorCfg = cfg(.connector, lowPrecision: config.lowPrecisionAccumForLLMs)
+        let eosCfg       = cfg(.eos,       lowPrecision: config.lowPrecisionAccumForLLMs)
 
         self.tokenizer = try await VibeVoiceTokenizer(modelsDir: config.modelsDir)
-        self.llm = try await LLMRunner(modelsDir: config.modelsDir, config: fp16Config)
+        self.llm = try await LLMRunner(
+            modelsDir: config.modelsDir, textConfig: textCfg, ttsConfig: ttsCfg,
+            ttsHandles: config.ttsHandles)
         self.diffusion = try await DiffusionRunner(
             modelURL: config.modelsDir.appendingPathComponent("diffusion_head.mlpackage"),
-            mlConfig: diffConfig,
+            mlConfig: diffCfg,
             steps: config.diffusionSteps,
             guidanceScale: config.guidanceScale
         )
         self.vae = try await VAERunner(
             modelURL: config.modelsDir.appendingPathComponent("vae_decoder.mlpackage"),
-            mlConfig: fp16Config
+            mlConfig: vaeCfg
         )
-        self.heads = try await HeadsRunner(modelsDir: config.modelsDir, config: fp16Config)
+        self.heads = try await HeadsRunner(
+            modelsDir: config.modelsDir, connectorConfig: connectorCfg, eosConfig: eosCfg)
+
+        if config.warmupAtInit {
+            // Capture local refs so the async-let tasks don't have to send
+            // `self` (Swift 6 strict-concurrency rejects that — `self` is
+            // task-isolated until init returns). Heads + VAE are class
+            // references, safe to share.
+            let heads = self.heads
+            let vae = self.vae
+            async let h: Void = heads.warmup()
+            async let v: Void = vae.warmup()
+            _ = try await (h, v)
+        }
     }
 
     /// Expose the tokenizer so callers (CLI, tests, parity harnesses) can
@@ -90,14 +144,17 @@ public final class VibeVoiceEngine {
 
     /// List available voices from the voices directory.
     public func availableVoices() -> [String] {
-        let voicesDir = config.modelsDir.appendingPathComponent("voices")
-        guard let contents = try? FileManager.default.contentsOfDirectory(
-            at: voicesDir, includingPropertiesForKeys: nil
-        ) else { return [] }
-        return contents
-            .filter { $0.hasDirectoryPath }
-            .map(\.lastPathComponent)
-            .sorted()
+        let fm = FileManager.default
+        let voicesDir = config.modelsDir.appendingPathComponent("voices").path
+        guard let names = try? fm.contentsOfDirectory(atPath: voicesDir) else { return [] }
+        // Path-based enumeration + per-entry `fileExists(isDirectory:)` is
+        // more robust than URL resource-value caching inside a signed .app
+        // bundle, where `.isDirectoryKey` has been observed to come back nil.
+        return names.filter { name in
+            var isDir: ObjCBool = false
+            let full = (voicesDir as NSString).appendingPathComponent(name)
+            return fm.fileExists(atPath: full, isDirectory: &isDir) && isDir.boolValue
+        }.sorted()
     }
 
     /// Load a voice prompt by name (e.g. "en-Frank_man").
