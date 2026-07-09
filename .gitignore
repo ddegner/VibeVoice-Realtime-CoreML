@@ -4,6 +4,7 @@ conversion/.venv/
 conversion/**/__pycache__/
 conversion/**/*.pyc
 swift/.build/
+swift/build/
 swift/.swiftpm/
 swift/Package.resolved
 .DS_Store

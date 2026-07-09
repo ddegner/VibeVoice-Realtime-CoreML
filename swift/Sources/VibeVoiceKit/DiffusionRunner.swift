@@ -109,6 +109,7 @@ public final class DiffusionRunner: @unchecked Sendable {
     /// Denoise a single speech latent frame using DPM-Solver++ order 2.
     /// Returns shape (1, 1, 64).
     public func denoiseFrame(cond: MLMultiArray, uncond: MLMultiArray) async throws -> MLMultiArray {
+        try Task.checkCancellation()
         let cond3 = try Self.expandToT1(cond, H: Self.H)
         let uncond3 = try Self.expandToT1(uncond, H: Self.H)
 
@@ -120,6 +121,7 @@ public final class DiffusionRunner: @unchecked Sendable {
         var orderUsed = 0
 
         for i in 0..<steps {
+            try Task.checkCancellation()
             let entry = schedule[i]
             tPtr[0] = Float(entry.timestep)
 
@@ -134,6 +136,7 @@ public final class DiffusionRunner: @unchecked Sendable {
             async let vCondTask = predict(latent: sampleIn, t: reusableTimestep, cond: cond3)
             async let vUncondTask = predict(latent: sampleIn, t: reusableTimestep, cond: uncond3)
             let (vCond, vUncond) = try await (vCondTask, vUncondTask)
+            try Task.checkCancellation()
             let v = try cfgBlend(uncond: vUncond, cond: vCond, scale: guidance)
 
             // v-prediction → x0
@@ -285,10 +288,12 @@ public final class DiffusionRunner: @unchecked Sendable {
     }
 
     private func predict(latent: MLMultiArray, t: MLMultiArray, cond: MLMultiArray) async throws -> MLMultiArray {
+        try Task.checkCancellation()
         let provider = try MLDictionaryFeatureProvider(dictionary: [
             "noisy_latent": latent, "timestep": t, "conditioning": cond,
         ])
         let out = try await model.prediction(from: provider)
+        try Task.checkCancellation()
         guard let v = out.featureValue(for: "predicted_noise")?.multiArrayValue else {
             throw NSError(domain: "VibeVoiceKit.DiffusionRunner", code: 2,
                           userInfo: [NSLocalizedDescriptionKey: "missing predicted_noise"])

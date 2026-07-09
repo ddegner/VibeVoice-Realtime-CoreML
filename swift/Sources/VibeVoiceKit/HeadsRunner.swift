@@ -64,8 +64,10 @@ public final class HeadsRunner: @unchecked Sendable {
     /// - Parameter latent: (1, T, 64)
     /// - Returns: (1, T, 896)
     public func project(latent: MLMultiArray) async throws -> MLMultiArray {
+        try Task.checkCancellation()
         let provider = try MLDictionaryFeatureProvider(dictionary: ["latent": latent])
         let out = try await connector.prediction(from: provider)
+        try Task.checkCancellation()
         guard let v = out.featureValue(for: "embedding")?.multiArrayValue else {
             throw NSError(domain: "VibeVoiceKit.HeadsRunner", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "connector missing output"])
@@ -75,8 +77,10 @@ public final class HeadsRunner: @unchecked Sendable {
 
     /// Run the EOS head on a (1, 896) hidden state; returns sigmoid prob (0…1).
     public func eosProbability(hidden: MLMultiArray) async throws -> Float {
+        try Task.checkCancellation()
         let provider = try MLDictionaryFeatureProvider(dictionary: ["hidden": hidden])
         let out = try await eos.prediction(from: provider)
+        try Task.checkCancellation()
         guard let p = out.featureValue(for: "prob")?.multiArrayValue else {
             throw NSError(domain: "VibeVoiceKit.HeadsRunner", code: 2,
                           userInfo: [NSLocalizedDescriptionKey: "eos missing output"])

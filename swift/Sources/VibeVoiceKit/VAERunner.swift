@@ -13,8 +13,10 @@ public final class VAERunner: @unchecked Sendable {
     /// (reflection padding prevented dynamic T). 16 latent frames ≈ 2.133 s
     /// of 24 kHz audio (3200× upsampling confirmed at conversion).
     public func decode(latents: MLMultiArray) async throws -> [Float] {
+        try Task.checkCancellation()
         let provider = try MLDictionaryFeatureProvider(dictionary: ["latent": latents])
         let out = try await model.prediction(from: provider)
+        try Task.checkCancellation()
         guard let waveform = out.featureValue(for: "waveform")?.multiArrayValue else {
             throw NSError(domain: "VibeVoiceKit.VAERunner", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "missing waveform output"])

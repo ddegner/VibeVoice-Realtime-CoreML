@@ -84,6 +84,7 @@ public final class LLMRunner: @unchecked Sendable {
         vCache: MLMultiArray,
         positionID: Int32
     ) async throws -> (hidden: MLMultiArray, k: MLMultiArray, v: MLMultiArray) {
+        try Task.checkCancellation()
         let ids = try Self.makeIDs(inputID)
         let pos = try Self.makeIDs(positionID)
 
@@ -91,6 +92,7 @@ public final class LLMRunner: @unchecked Sendable {
             "input_ids": ids, "k_cache": kCache, "v_cache": vCache, "position_ids": pos,
         ])
         let out = try await textDecode.prediction(from: provider)
+        try Task.checkCancellation()
         return try Self.unpackDecode(out)
     }
 
@@ -121,6 +123,7 @@ public final class LLMRunner: @unchecked Sendable {
         vCache: MLMultiArray,
         positionID: Int32
     ) async throws -> (hidden: MLMultiArray, k: MLMultiArray, v: MLMultiArray) {
+        try Task.checkCancellation()
         // Per-call scratch — required so two concurrent calls (pos/neg CFG
         // branches) don't clobber each other's inputs mid-flight.
         let ids = try Self.makeIDs(inputID)
@@ -139,6 +142,7 @@ public final class LLMRunner: @unchecked Sendable {
         ])
         let model = ttsDecodes[branch % ttsDecodes.count]
         let out = try await model.prediction(from: provider)
+        try Task.checkCancellation()
         return try Self.unpackDecode(out)
     }
 

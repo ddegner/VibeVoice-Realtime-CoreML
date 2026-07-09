@@ -177,6 +177,7 @@ public final class TTSLoop: @unchecked Sendable {
         var textOffset = 0
 
         while !finished {
+            try Task.checkCancellation()
             // == Text window: feed up to `textWindowSize` tokens ==
             let windowEnd = min(textOffset + config.textWindowSize, tokens.count)
             let textWindow = Array(tokens[textOffset..<windowEnd])
@@ -189,9 +190,11 @@ public final class TTSLoop: @unchecked Sendable {
                 // `lm_last_hidden_state` — we replicate in decode mode).
                 var perTokenHidden: [MLMultiArray] = []
                 for tok in textWindow {
+                    try Task.checkCancellation()
                     let t0 = CFAbsoluteTimeGetCurrent()
                     let step = try await llm.textDecodeStep(
                         inputID: tok, kCache: lmK, vCache: lmV, positionID: lmPos)
+                    try Task.checkCancellation()
                     timing.textLMDecode += CFAbsoluteTimeGetCurrent() - t0
                     lmK = step.k; lmV = step.v
                     perTokenHidden.append(step.hidden)
@@ -199,11 +202,13 @@ public final class TTSLoop: @unchecked Sendable {
                 }
 
                 for (i, tok) in textWindow.enumerated() {
+                    try Task.checkCancellation()
                     let t0 = CFAbsoluteTimeGetCurrent()
                     let posStep = try await llm.ttsDecodeStep(
                         inputID: tok, lmHidden: perTokenHidden[i],
                         tailMask: 1.0, textMask: 1,
                         kCache: posK, vCache: posV, positionID: posPos)
+                    try Task.checkCancellation()
                     timing.ttsLMDecode += CFAbsoluteTimeGetCurrent() - t0
                     posK = posStep.k; posV = posStep.v
                     try lastPositionInto(posStep.hidden, dest: posLast)
@@ -213,11 +218,13 @@ public final class TTSLoop: @unchecked Sendable {
 
             // == Speech window: sample up to `speechWindowSize` frames ==
             for _ in 0..<config.speechWindowSize {
+                try Task.checkCancellation()
                 if totalSpeechFrames >= config.maxFrames { finished = true; break }
 
                 // Diffusion sample one frame using CFG
                 let tDiff = CFAbsoluteTimeGetCurrent()
                 let latent = try await diffusion.denoiseFrame(cond: posLast, uncond: negLast)
+                try Task.checkCancellation()
                 timing.diffusion += CFAbsoluteTimeGetCurrent() - tDiff
                 allLatents.append(latent)
                 totalSpeechFrames += 1
@@ -256,6 +263,7 @@ public final class TTSLoop: @unchecked Sendable {
                 // Project latent → LM hidden for feedback
                 let tConn = CFAbsoluteTimeGetCurrent()
                 let acousticEmbed = try await heads.project(latent: latent)
+                try Task.checkCancellation()
                 timing.connector += CFAbsoluteTimeGetCurrent() - tConn
 
                 // Advance both TTS LM branches (speech position).
@@ -283,6 +291,7 @@ public final class TTSLoop: @unchecked Sendable {
                     tailMask: 1.0, textMask: 0,
                     kCache: negKIn, vCache: negVIn, positionID: negPosIn)
                 let (posStep, negStep) = try await (posTask, negTask)
+                try Task.checkCancellation()
                 posK = posStep.k; posV = posStep.v
                 try lastPositionInto(posStep.hidden, dest: posLast)
                 posPos += 1
@@ -303,6 +312,7 @@ public final class TTSLoop: @unchecked Sendable {
                 } else {
                     let tEos = CFAbsoluteTimeGetCurrent()
                     let eosProb = try await heads.eosProbability(hidden: posLast)
+                    try Task.checkCancellation()
                     timing.eos += CFAbsoluteTimeGetCurrent() - tEos
                     if config.logEOSTrajectory {
                         let fired = eosProb > config.eosThreshold ? " <-- EOS" : ""
@@ -333,6 +343,7 @@ public final class TTSLoop: @unchecked Sendable {
         //   (b) Some "tail" frames past the last stride boundary — decode a
         //       window of the LAST T frames (so the tail sees full left
         //       context), and discard everything already emitted.
+        try Task.checkCancellation()
         if decodedFrames < allLatents.count {
             let t0 = CFAbsoluteTimeGetCurrent()
             try await drainRemaining(
@@ -549,7 +560,9 @@ public final class TTSLoop: @unchecked Sendable {
             }
         }
 
+        try Task.checkCancellation()
         let samples = try await vae.decode(latents: out)
+        try Task.checkCancellation()
         let skipFrames = decodedFrames - windowStart
         let skip = skipFrames * Self.samplesPerFrame
         let keep = framesToEmit * Self.samplesPerFrame
