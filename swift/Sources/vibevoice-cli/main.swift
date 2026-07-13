@@ -54,6 +54,15 @@ struct VibeVoiceCLI: AsyncParsableCommand {
     @Option(help: "Phase 5 CFG multiplex: number of tts_lm_decode MLModel handles to load (default 1). Set 2 to alternate pos/neg branches.")
     var ttsHandles: Int = 1
 
+    @Flag(help: "Benchmark loading independent CoreML artifacts concurrently.")
+    var parallelModelLoading: Bool = false
+
+    @Option(help: "Number of syntheses to run after one model load.")
+    var syntheses: Int = 1
+
+    @Flag(help: "Run multiple syntheses concurrently through the shared engine.")
+    var concurrentSyntheses: Bool = false
+
     func run() async throws {
         let quiet = jsonTiming
         func say(_ s: @autoclosure () -> String) { if !quiet { print(s()) } }
@@ -66,9 +75,16 @@ struct VibeVoiceCLI: AsyncParsableCommand {
             cfg.computeUnitsByKind = try parseComputeUnits(raw)
         }
         cfg.ttsHandles = ttsHandles
+        cfg.parallelModelLoading = parallelModelLoading
+
+        guard syntheses > 0 else {
+            throw ValidationError("--syntheses must be greater than zero")
+        }
 
         say("Loading engine from \(modelsDir.path)…")
+        let loadStarted = CFAbsoluteTimeGetCurrent()
         let engine = try await VibeVoiceEngine(config: cfg)
+        let loadSeconds = CFAbsoluteTimeGetCurrent() - loadStarted
         if let seed = seed {
             engine.setSeed(seed)
             say("Diffusion seed: \(seed)")
@@ -88,27 +104,77 @@ struct VibeVoiceCLI: AsyncParsableCommand {
         var loopConfig = TTSLoop.Config()
         loopConfig.logEOSTrajectory = traceEOS
         loopConfig.maxFrames = maxFrames
-        let (samples, timing) = try await engine.synthesize(
-            text: text, voicePrompt: voicePrompt, loopConfig: loopConfig)
+        let synthesisStarted = CFAbsoluteTimeGetCurrent()
+        let results: [SynthesisResult]
+        if concurrentSyntheses && syntheses > 1 {
+            let synthesisEngine = engine
+            let synthesisText = text
+            let synthesisPrompt = voicePrompt
+            let synthesisLoopConfig = loopConfig
+            let synthesisCount = syntheses
+            results = try await withThrowingTaskGroup(of: SynthesisResult.self) { group in
+                for index in 0..<synthesisCount {
+                    group.addTask {
+                        let result = try await synthesisEngine.synthesize(
+                            text: synthesisText,
+                            voicePrompt: synthesisPrompt,
+                            loopConfig: synthesisLoopConfig)
+                        return SynthesisResult(index: index, samples: result.samples, timing: result.timing)
+                    }
+                }
+                var gathered: [SynthesisResult] = []
+                for try await result in group { gathered.append(result) }
+                return gathered.sorted { $0.index < $1.index }
+            }
+        } else {
+            var gathered: [SynthesisResult] = []
+            for index in 0..<syntheses {
+                let result = try await engine.synthesize(
+                    text: text, voicePrompt: voicePrompt, loopConfig: loopConfig)
+                gathered.append(SynthesisResult(
+                    index: index, samples: result.samples, timing: result.timing))
+            }
+            results = gathered
+        }
+        let synthesisWallSeconds = CFAbsoluteTimeGetCurrent() - synthesisStarted
+        let outURL = URL(fileURLWithPath: output)
+        for result in results {
+            let resultURL = syntheses == 1
+                ? outURL
+                : outURL.deletingPathExtension()
+                    .appendingPathExtension("\(result.index + 1).wav")
+            try AudioPlayer.writeWAV(result.samples, to: resultURL)
+            say("Wrote \(resultURL.path)")
+        }
+
+        guard let first = results.first else { return }
+        let samples = first.samples
+        let timing = first.timing
         let audioDur = Double(samples.count) / 24_000.0
+        let totalAudioDur = results.reduce(0.0) { $0 + Double($1.samples.count) / 24_000.0 }
         say("Generated \(samples.count) samples (\(String(format: "%.2f", audioDur)) s)")
         say("\(timing)")
         let rtf = timing.total / audioDur
         say(String(format: "Real-time factor: %.2fx (%.2fs wall / %.2fs audio)", rtf, timing.total, audioDur))
 
-        let outURL = URL(fileURLWithPath: output)
-        try AudioPlayer.writeWAV(samples, to: outURL)
-        say("Wrote \(outURL.path)")
-
         if jsonTiming {
             let stats = AudioStats.compute(samples)
             let line = JSONTimingLine.encode(
                 label: label,
+                modelsDir: modelsDir.path,
+                outputPath: outURL.path,
                 voice: voice,
                 seed: seed,
                 charCount: text.count,
                 steps: steps,
                 guidance: guidance,
+                computeUnits: computeUnits,
+                ttsHandles: ttsHandles,
+                loadSeconds: loadSeconds,
+                synthesisWallSeconds: synthesisWallSeconds,
+                syntheses: syntheses,
+                concurrentSyntheses: concurrentSyntheses,
+                totalAudioDuration: totalAudioDur,
                 maxFrames: maxFrames,
                 samples: samples.count,
                 timing: timing,
@@ -122,6 +188,12 @@ struct VibeVoiceCLI: AsyncParsableCommand {
             try? await Task.sleep(nanoseconds: UInt64(Double(samples.count) / 24_000.0 * 1e9) + 500_000_000)
         }
     }
+}
+
+struct SynthesisResult: Sendable {
+    let index: Int
+    let samples: [Float]
+    let timing: TTSLoop.Timing
 }
 
 // MARK: - Compute-unit parsing
@@ -256,11 +328,20 @@ struct AudioStats {
 enum JSONTimingLine {
     static func encode(
         label: String?,
+        modelsDir: String,
+        outputPath: String,
         voice: String,
         seed: UInt64?,
         charCount: Int,
         steps: Int,
         guidance: Float,
+        computeUnits: String?,
+        ttsHandles: Int,
+        loadSeconds: Double,
+        synthesisWallSeconds: Double,
+        syntheses: Int,
+        concurrentSyntheses: Bool,
+        totalAudioDuration: Double,
         maxFrames: Int,
         samples: Int,
         timing: TTSLoop.Timing,
@@ -272,11 +353,20 @@ enum JSONTimingLine {
             "ts": iso,
             "git_sha": gitSHA() ?? NSNull(),
             "label": label ?? NSNull(),
+            "models_dir": modelsDir,
+            "output": outputPath,
             "voice": voice,
             "seed": seed.map { Int64(bitPattern: $0) } as Any? ?? NSNull(),
             "char_count": charCount,
             "diffusion_steps": steps,
             "guidance": Double(guidance),
+            "compute_units": computeUnits ?? NSNull(),
+            "tts_handles": ttsHandles,
+            "load_seconds": loadSeconds,
+            "synthesis_wall_seconds": synthesisWallSeconds,
+            "syntheses": syntheses,
+            "concurrent_syntheses": concurrentSyntheses,
+            "aggregate_rt_factor": totalAudioDuration > 0 ? synthesisWallSeconds / totalAudioDuration : 0,
             "max_frames": maxFrames,
             "samples": samples,
             "audio_duration_sec": stats.durationSec,

@@ -29,7 +29,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
-from _common import OUT_DIR, assert_parity, load_vibevoice  # noqa: E402
+from _common import OUT_DIR, assert_parity, coreml_compute_precision, load_vibevoice, parity_tolerance  # noqa: E402
 
 
 class ConnectorWrapper(torch.nn.Module):
@@ -78,7 +78,7 @@ def main() -> int:
         inputs=[ct.TensorType(name="latent", shape=(1, ct.RangeDim(1, 4096), 64))],
         outputs=[ct.TensorType(name="embedding")],
         compute_units=ct.ComputeUnit.CPU_AND_GPU,
-        compute_precision=ct.precision.FLOAT32,
+        compute_precision=coreml_compute_precision(ct),
         minimum_deployment_target=ct.target.iOS18,
         convert_to="mlprogram",
     )
@@ -86,7 +86,12 @@ def main() -> int:
     with torch.no_grad():
         py = cw(ex_lat)
     ml = ml_connector.predict({"latent": ex_lat.numpy()})
-    assert_parity(py, ml["embedding"], tol=1e-5, label="acoustic_connector")
+    assert_parity(
+        py,
+        ml["embedding"],
+        tol=parity_tolerance(float32=1e-5, float16=5e-3),
+        label="acoustic_connector",
+    )
 
     # --- tts_eos_classifier ---------------------------------------------------
     ew = EOSWrapper(classifier).eval()
@@ -98,7 +103,7 @@ def main() -> int:
         inputs=[ct.TensorType(name="hidden", shape=(1, 896))],
         outputs=[ct.TensorType(name="prob")],
         compute_units=ct.ComputeUnit.CPU_AND_GPU,
-        compute_precision=ct.precision.FLOAT32,
+        compute_precision=coreml_compute_precision(ct),
         minimum_deployment_target=ct.target.iOS18,
         convert_to="mlprogram",
     )
@@ -106,7 +111,12 @@ def main() -> int:
     with torch.no_grad():
         py = ew(ex_hid)
     ml = ml_eos.predict({"hidden": ex_hid.numpy()})
-    assert_parity(py, ml["prob"], tol=1e-5, label="tts_eos_classifier")
+    assert_parity(
+        py,
+        ml["prob"],
+        tol=parity_tolerance(float32=1e-5, float16=5e-3),
+        label="tts_eos_classifier",
+    )
 
     return 0
 

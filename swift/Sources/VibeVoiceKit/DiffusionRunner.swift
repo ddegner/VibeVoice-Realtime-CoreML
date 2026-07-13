@@ -22,16 +22,18 @@ public final class DiffusionRunner: @unchecked Sendable {
     public static let H = 896
 
     private let model: MLModel
+    private let batchedModel: MLModel?
     /// DPM-Solver++ step count for each frame. Publicly readable so the
     /// timing reporter can log "N steps × 2 CFG" without hardcoding.
     public let steps: Int
     private let guidance: Float
     private let trainSteps: Int = 1000
 
-    /// Deterministic RNG used for initial-noise sampling. When non-nil, the
-    /// same sentence+voice produces bit-identical output every run. Set via
-    /// `setSeed(_:)`. Default is the system RNG (non-reproducible).
-    private var rng: SplitMix64? = nil
+    /// Seed copied into a fresh per-synthesis session. Keeping the mutable RNG
+    /// and timestep buffer in that session lets independent chunks share the
+    /// same immutable CoreML model safely.
+    private let seedLock = NSLock()
+    private var defaultSeed: UInt64? = nil
 
     // Pre-computed schedule
     private struct ScheduleEntry {
@@ -44,11 +46,28 @@ public final class DiffusionRunner: @unchecked Sendable {
     private let finalAlpha: Double  // alpha at sigma=0 (i.e., 1.0)
     private let finalSigma: Double  // 0.0
 
-    // Pre-allocated timestep input
-    private let reusableTimestep: MLMultiArray
+    public final class Session: @unchecked Sendable {
+        fileprivate var rng: SplitMix64?
+        fileprivate let timestep: MLMultiArray
+
+        fileprivate init(seed: UInt64?) throws {
+            self.rng = seed.map(SplitMix64.init(seed:))
+            self.timestep = try MLMultiArray(shape: [1], dataType: .float32)
+        }
+    }
 
     public init(modelURL: URL, mlConfig: MLModelConfiguration, steps: Int, guidanceScale: Float) async throws {
         self.model = try await ModelLoader.load(packageURL: modelURL, configuration: mlConfig)
+        let batchedURL = modelURL.deletingLastPathComponent()
+            .appendingPathComponent("diffusion_head_cfg2.mlpackage")
+        let batchedCompiled = batchedURL.deletingPathExtension().appendingPathExtension("mlmodelc")
+        if FileManager.default.fileExists(atPath: batchedURL.path)
+            || FileManager.default.fileExists(atPath: batchedCompiled.path) {
+            self.batchedModel = try await ModelLoader.load(
+                packageURL: batchedURL, configuration: mlConfig)
+        } else {
+            self.batchedModel = nil
+        }
         self.steps = steps
         self.guidance = guidanceScale
 
@@ -101,20 +120,30 @@ public final class DiffusionRunner: @unchecked Sendable {
         self.finalAlpha = 1.0   // final_sigmas_type = "zero"
         self.finalSigma = 0.0
 
-        self.reusableTimestep = try MLMultiArray(shape: [1], dataType: .float32)
     }
 
     // MARK: - Public API
 
     /// Denoise a single speech latent frame using DPM-Solver++ order 2.
     /// Returns shape (1, 1, 64).
-    public func denoiseFrame(cond: MLMultiArray, uncond: MLMultiArray) async throws -> MLMultiArray {
+    public func makeSession() throws -> Session {
+        seedLock.lock()
+        let seed = defaultSeed
+        seedLock.unlock()
+        return try Session(seed: seed)
+    }
+
+    public func denoiseFrame(
+        cond: MLMultiArray,
+        uncond: MLMultiArray,
+        session: Session
+    ) async throws -> MLMultiArray {
         try Task.checkCancellation()
         let cond3 = try Self.expandToT1(cond, H: Self.H)
         let uncond3 = try Self.expandToT1(uncond, H: Self.H)
 
-        var sample = try randomNormal(shape: [1, 1, Self.D] as [NSNumber])
-        let tPtr = reusableTimestep.dataPointer.assumingMemoryBound(to: Float.self)
+        var sample = try randomNormal(shape: [1, 1, Self.D] as [NSNumber], session: session)
+        let tPtr = session.timestep.dataPointer.assumingMemoryBound(to: Float.self)
 
         // DPM-Solver++ state: history of x0 predictions for multistep
         var prevX0: MLMultiArray? = nil
@@ -126,16 +155,29 @@ public final class DiffusionRunner: @unchecked Sendable {
             tPtr[0] = Float(entry.timestep)
 
             // CFG branches are independent — dispatch both concurrently.
-            // `sample` and `reusableTimestep` are read-only for the duration
+            // `sample` and the session timestep are read-only for the duration
             // of these two calls (we only write to `tPtr[0]` *before* dispatch),
             // and the CoreML model is thread-safe. The `let sampleIn` binding
             // satisfies Swift 6's rule that `async let` captures must be
             // `Sendable` / `let` — the MLMultiArray reference itself is
             // copied, not its memory.
             let sampleIn = sample
-            async let vCondTask = predict(latent: sampleIn, t: reusableTimestep, cond: cond3)
-            async let vUncondTask = predict(latent: sampleIn, t: reusableTimestep, cond: uncond3)
-            let (vCond, vUncond) = try await (vCondTask, vUncondTask)
+            let vCond: MLMultiArray
+            let vUncond: MLMultiArray
+            if let batchedModel {
+                let pair = try await predictCFG(
+                    model: batchedModel,
+                    latent: sampleIn,
+                    t: session.timestep,
+                    cond: cond3,
+                    uncond: uncond3)
+                vCond = pair.cond
+                vUncond = pair.uncond
+            } else {
+                async let vCondTask = predict(latent: sampleIn, t: session.timestep, cond: cond3)
+                async let vUncondTask = predict(latent: sampleIn, t: session.timestep, cond: uncond3)
+                (vCond, vUncond) = try await (vCondTask, vUncondTask)
+            }
             try Task.checkCancellation()
             let v = try cfgBlend(uncond: vUncond, cond: vCond, scale: guidance)
 
@@ -301,6 +343,30 @@ public final class DiffusionRunner: @unchecked Sendable {
         return v
     }
 
+    private func predictCFG(
+        model: MLModel,
+        latent: MLMultiArray,
+        t: MLMultiArray,
+        cond: MLMultiArray,
+        uncond: MLMultiArray
+    ) async throws -> (cond: MLMultiArray, uncond: MLMultiArray) {
+        let provider = try MLDictionaryFeatureProvider(dictionary: [
+            "noisy_latent": latent,
+            "timestep": t,
+            "conditioning": cond,
+            "unconditioning": uncond,
+        ])
+        let output = try await model.prediction(from: provider)
+        guard
+            let condOut = output.featureValue(for: "predicted_noise_cond")?.multiArrayValue,
+            let uncondOut = output.featureValue(for: "predicted_noise_uncond")?.multiArrayValue
+        else {
+            throw NSError(domain: "VibeVoiceKit.DiffusionRunner", code: 6,
+                          userInfo: [NSLocalizedDescriptionKey: "batched diffusion outputs missing"])
+        }
+        return (condOut, uncondOut)
+    }
+
     static func expandToT1(_ a: MLMultiArray, H: Int) throws -> MLMultiArray {
         if a.shape.count == 3 { return a }
         precondition(a.shape.map(\.intValue) == [1, H], "unexpected cond shape \(a.shape)")
@@ -309,7 +375,7 @@ public final class DiffusionRunner: @unchecked Sendable {
         return out
     }
 
-    private func randomNormal(shape: [NSNumber]) throws -> MLMultiArray {
+    private func randomNormal(shape: [NSNumber], session: Session) throws -> MLMultiArray {
         let out = try MLMultiArray(shape: shape, dataType: .float32)
         let p = out.dataPointer.assumingMemoryBound(to: Float.self)
         // Box-Muller in Double precision (truncate to Float only at store time).
@@ -322,10 +388,10 @@ public final class DiffusionRunner: @unchecked Sendable {
         // stutters ("lazy" → "la-lazy"). Keep the uniform draws and Box-Muller
         // arithmetic in fp64 so the noise stream matches the reference bit-for-
         // bit (within Double roundoff).
-        if rng != nil {
+        if session.rng != nil {
             for i in 0..<out.count {
-                let u1 = max(Double.leastNormalMagnitude, rng!.nextUnit())
-                let u2 = rng!.nextUnit()
+                let u1 = max(Double.leastNormalMagnitude, session.rng!.nextUnit())
+                let u2 = session.rng!.nextUnit()
                 let n = (-2.0 * log(u1)).squareRoot() * cos(2.0 * .pi * u2)
                 p[i] = Float(n)
             }
@@ -343,11 +409,9 @@ public final class DiffusionRunner: @unchecked Sendable {
     /// Seed the diffusion noise RNG for reproducible output. Pass `nil` to
     /// revert to the system (non-deterministic) RNG.
     public func setSeed(_ seed: UInt64?) {
-        if let seed = seed {
-            self.rng = SplitMix64(seed: seed)
-        } else {
-            self.rng = nil
-        }
+        seedLock.lock()
+        defaultSeed = seed
+        seedLock.unlock()
     }
 }
 

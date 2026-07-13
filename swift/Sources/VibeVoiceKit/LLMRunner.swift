@@ -15,6 +15,12 @@ public final class LLMRunner: @unchecked Sendable {
     /// a single handle is a per-platform measurement question (Phase 5
     /// sweep). Defaults to 1.
     private let ttsDecodes: [MLModel]
+    private let ttsCFGDecode: MLModel?
+    private let textBlockDecode: MLModel?
+    private let ttsTextBlockDecode: MLModel?
+
+    public var hasBatchedCFG: Bool { ttsCFGDecode != nil }
+    public var hasBlockDecode: Bool { textBlockDecode != nil && ttsTextBlockDecode != nil }
 
     // NOTE: decode input arrays are allocated **per call** rather than kept as
     // stored properties. Earlier revisions pre-allocated (1,1) buffers on `self`
@@ -62,6 +68,12 @@ public final class LLMRunner: @unchecked Sendable {
             handles.append(try await load("tts_lm_decode.mlpackage", config: ttsConfig, required: true)!)
         }
         self.ttsDecodes = handles
+        self.ttsCFGDecode = try await load(
+            "tts_lm_decode_cfg2.mlpackage", config: ttsConfig, required: false)
+        self.textBlockDecode = try await load(
+            "text_lm_decode_block5.mlpackage", config: textConfig, required: false)
+        self.ttsTextBlockDecode = try await load(
+            "tts_lm_decode_block5.mlpackage", config: ttsConfig, required: false)
     }
 
     // MARK: - Per-call scratch allocation (concurrency-safe)
@@ -75,6 +87,34 @@ public final class LLMRunner: @unchecked Sendable {
         let a = try MLMultiArray(shape: [1, 1, 1], dataType: .float32)
         a.dataPointer.assumingMemoryBound(to: Float.self)[0] = value
         return a
+    }
+
+    private static func makeIDs(_ values: [Int32]) throws -> MLMultiArray {
+        let array = try MLMultiArray(
+            shape: [1, NSNumber(value: values.count)], dataType: .int32)
+        let pointer = array.dataPointer.assumingMemoryBound(to: Int32.self)
+        for (index, value) in values.enumerated() { pointer[index] = value }
+        return array
+    }
+
+    private static func makePositions(start: Int32, count: Int) throws -> MLMultiArray {
+        try makeIDs((0..<count).map { start + Int32($0) })
+    }
+
+    private static func makeCausalMask(pastLength: Int, queryLength: Int) throws -> MLMultiArray {
+        let totalLength = pastLength + queryLength
+        let array = try MLMultiArray(
+            shape: [1, 1, NSNumber(value: queryLength), NSNumber(value: totalLength)],
+            dataType: .float32)
+        let pointer = array.dataPointer.assumingMemoryBound(to: Float.self)
+        for query in 0..<queryLength {
+            let allowed = pastLength + query + 1
+            let row = query * totalLength
+            for key in 0..<totalLength {
+                pointer[row + key] = key < allowed ? 0 : -10_000
+            }
+        }
+        return array
     }
 
     /// One *text* LM decode step (plain Qwen2 graph).
@@ -94,6 +134,53 @@ public final class LLMRunner: @unchecked Sendable {
         let out = try await textDecode.prediction(from: provider)
         try Task.checkCancellation()
         return try Self.unpackDecode(out)
+    }
+
+    public func textDecodeBlock(
+        inputIDs: [Int32],
+        kCache: MLMultiArray,
+        vCache: MLMultiArray,
+        positionID: Int32
+    ) async throws -> (hidden: MLMultiArray, k: MLMultiArray, v: MLMultiArray) {
+        guard inputIDs.count == 5, let model = textBlockDecode else {
+            throw NSError(domain: "VibeVoiceKit.LLMRunner", code: 6,
+                          userInfo: [NSLocalizedDescriptionKey: "text block model unavailable"])
+        }
+        let pastLength = kCache.shape[3].intValue
+        let provider = try MLDictionaryFeatureProvider(dictionary: [
+            "input_ids": try Self.makeIDs(inputIDs),
+            "k_cache": kCache,
+            "v_cache": vCache,
+            "position_ids": try Self.makePositions(start: positionID, count: inputIDs.count),
+            "attention_mask": try Self.makeCausalMask(
+                pastLength: pastLength, queryLength: inputIDs.count),
+        ])
+        let output = try await model.prediction(from: provider)
+        return try Self.unpackDecode(output)
+    }
+
+    public func ttsTextDecodeBlock(
+        lmHidden: MLMultiArray,
+        kCache: MLMultiArray,
+        vCache: MLMultiArray,
+        positionID: Int32
+    ) async throws -> (hidden: MLMultiArray, k: MLMultiArray, v: MLMultiArray) {
+        guard lmHidden.shape[1].intValue == 5, let model = ttsTextBlockDecode else {
+            throw NSError(domain: "VibeVoiceKit.LLMRunner", code: 7,
+                          userInfo: [NSLocalizedDescriptionKey: "TTS text block model unavailable"])
+        }
+        let queryLength = lmHidden.shape[1].intValue
+        let pastLength = kCache.shape[3].intValue
+        let provider = try MLDictionaryFeatureProvider(dictionary: [
+            "lm_hidden": lmHidden,
+            "k_cache": kCache,
+            "v_cache": vCache,
+            "position_ids": try Self.makePositions(start: positionID, count: queryLength),
+            "attention_mask": try Self.makeCausalMask(
+                pastLength: pastLength, queryLength: queryLength),
+        ])
+        let output = try await model.prediction(from: provider)
+        return try Self.unpackDecode(output)
     }
 
     /// One *TTS* LM decode step. Matches the mask-form graph from
@@ -144,6 +231,150 @@ public final class LLMRunner: @unchecked Sendable {
         let out = try await model.prediction(from: provider)
         try Task.checkCancellation()
         return try Self.unpackDecode(out)
+    }
+
+    /// Speech-only CFG decode using one batch-2 CoreML prediction. Positive
+    /// and negative voice caches have different logical lengths, so the
+    /// shorter cache is right-aligned in a masked batch tensor and restored
+    /// to its original logical length after prediction.
+    public func ttsDecodeCFGStep(
+        lmHidden: MLMultiArray,
+        posK: MLMultiArray,
+        posV: MLMultiArray,
+        posPosition: Int32,
+        negK: MLMultiArray,
+        negV: MLMultiArray,
+        negPosition: Int32
+    ) async throws -> (
+        pos: (hidden: MLMultiArray, k: MLMultiArray, v: MLMultiArray),
+        neg: (hidden: MLMultiArray, k: MLMultiArray, v: MLMultiArray)
+    ) {
+        guard let model = ttsCFGDecode else {
+            throw NSError(domain: "VibeVoiceKit.LLMRunner", code: 4,
+                          userInfo: [NSLocalizedDescriptionKey: "batched CFG model not loaded"])
+        }
+        try Task.checkCancellation()
+
+        let posShape = posK.shape.map(\.intValue)
+        let negShape = negK.shape.map(\.intValue)
+        precondition(posShape.count == 5 && negShape.count == 5)
+        precondition(posShape[0] == negShape[0] && posShape[1] == 1 && negShape[1] == 1)
+        precondition(posShape[2] == negShape[2] && posShape[4] == negShape[4])
+        let layers = posShape[0]
+        let kvHeads = posShape[2]
+        let dim = posShape[4]
+        let posLength = posShape[3]
+        let negLength = negShape[3]
+        let commonLength = max(posLength, negLength)
+        let posPad = commonLength - posLength
+        let negPad = commonLength - negLength
+
+        func pack(_ pos: MLMultiArray, _ neg: MLMultiArray) throws -> MLMultiArray {
+            let out = try MLMultiArray(
+                shape: [layers, 2, kvHeads, commonLength, dim].map(NSNumber.init(value:)),
+                dataType: .float32)
+            memset(out.dataPointer, 0, out.count * MemoryLayout<Float>.size)
+            let dst = out.dataPointer.assumingMemoryBound(to: Float.self)
+            let posSrc = pos.dataPointer.assumingMemoryBound(to: Float.self)
+            let negSrc = neg.dataPointer.assumingMemoryBound(to: Float.self)
+            for layer in 0..<layers {
+                for head in 0..<kvHeads {
+                    let posSourceOffset = (layer * kvHeads + head) * posLength * dim
+                    let posDestOffset = ((layer * 2) * kvHeads + head) * commonLength * dim
+                        + posPad * dim
+                    memcpy(dst.advanced(by: posDestOffset),
+                           posSrc.advanced(by: posSourceOffset),
+                           posLength * dim * MemoryLayout<Float>.size)
+
+                    let negSourceOffset = (layer * kvHeads + head) * negLength * dim
+                    let negDestOffset = ((layer * 2 + 1) * kvHeads + head) * commonLength * dim
+                        + negPad * dim
+                    memcpy(dst.advanced(by: negDestOffset),
+                           negSrc.advanced(by: negSourceOffset),
+                           negLength * dim * MemoryLayout<Float>.size)
+                }
+            }
+            return out
+        }
+
+        let batchK = try pack(posK, negK)
+        let batchV = try pack(posV, negV)
+        let positions = try MLMultiArray(shape: [2, 1], dataType: .int32)
+        let positionPtr = positions.dataPointer.assumingMemoryBound(to: Int32.self)
+        positionPtr[0] = posPosition
+        positionPtr[1] = negPosition
+
+        let attentionMask = try MLMultiArray(
+            shape: [2, 1, 1, commonLength + 1].map(NSNumber.init(value:)),
+            dataType: .float32)
+        let mask = attentionMask.dataPointer.assumingMemoryBound(to: Float.self)
+        for i in 0..<(2 * (commonLength + 1)) { mask[i] = 0 }
+        for i in 0..<posPad { mask[i] = -10_000 }
+        let negMaskOffset = commonLength + 1
+        for i in 0..<negPad { mask[negMaskOffset + i] = -10_000 }
+
+        let provider = try MLDictionaryFeatureProvider(dictionary: [
+            "lm_hidden": lmHidden,
+            "k_cache": batchK,
+            "v_cache": batchV,
+            "position_ids": positions,
+            "attention_mask": attentionMask,
+        ])
+        let output = try await model.prediction(from: provider)
+        try Task.checkCancellation()
+        guard
+            let hidden = output.featureValue(for: "hidden_states")?.multiArrayValue,
+            let kOut = output.featureValue(for: "k_cache_out")?.multiArrayValue,
+            let vOut = output.featureValue(for: "v_cache_out")?.multiArrayValue
+        else {
+            throw NSError(domain: "VibeVoiceKit.LLMRunner", code: 5,
+                          userInfo: [NSLocalizedDescriptionKey: "batched CFG outputs missing"])
+        }
+
+        func splitHidden(branch: Int) throws -> MLMultiArray {
+            let out = try MLMultiArray(shape: [1, 1, 896], dataType: .float32)
+            let src = hidden.dataPointer.assumingMemoryBound(to: Float.self)
+            memcpy(out.dataPointer, src.advanced(by: branch * 896),
+                   896 * MemoryLayout<Float>.size)
+            return out
+        }
+
+        func splitCache(
+            _ batch: MLMultiArray,
+            branch: Int,
+            logicalLength: Int,
+            pad: Int
+        ) throws -> MLMultiArray {
+            let outputLength = logicalLength + 1
+            let batchLength = commonLength + 1
+            let out = try MLMultiArray(
+                shape: [layers, 1, kvHeads, outputLength, dim].map(NSNumber.init(value:)),
+                dataType: .float32)
+            let src = batch.dataPointer.assumingMemoryBound(to: Float.self)
+            let dst = out.dataPointer.assumingMemoryBound(to: Float.self)
+            for layer in 0..<layers {
+                for head in 0..<kvHeads {
+                    let sourceOffset = ((layer * 2 + branch) * kvHeads + head)
+                        * batchLength * dim + pad * dim
+                    let destinationOffset = (layer * kvHeads + head) * outputLength * dim
+                    memcpy(dst.advanced(by: destinationOffset),
+                           src.advanced(by: sourceOffset),
+                           outputLength * dim * MemoryLayout<Float>.size)
+                }
+            }
+            return out
+        }
+
+        return (
+            pos: (
+                try splitHidden(branch: 0),
+                try splitCache(kOut, branch: 0, logicalLength: posLength, pad: posPad),
+                try splitCache(vOut, branch: 0, logicalLength: posLength, pad: posPad)),
+            neg: (
+                try splitHidden(branch: 1),
+                try splitCache(kOut, branch: 1, logicalLength: negLength, pad: negPad),
+                try splitCache(vOut, branch: 1, logicalLength: negLength, pad: negPad))
+        )
     }
 
     private static func unpackDecode(_ out: MLFeatureProvider) throws

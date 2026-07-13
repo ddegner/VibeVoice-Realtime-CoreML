@@ -2,22 +2,56 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT_DIR = ROOT / "out"
-MANIFEST_PATH = OUT_DIR / "model_manifest.json"
+OUT_DIR = Path(os.environ.get("VIBEVOICE_OUT_DIR", ROOT / "out")).expanduser()
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+MANIFEST_PATH = Path(
+    os.environ.get("VIBEVOICE_MANIFEST_PATH", OUT_DIR / "model_manifest.json")
+).expanduser()
 
 
 def load_manifest() -> dict[str, Any]:
+    candidates = [MANIFEST_PATH]
+    default_manifest = ROOT / "out" / "model_manifest.json"
+    if default_manifest != MANIFEST_PATH:
+        candidates.append(default_manifest)
+
+    for path in candidates:
+        if path.exists():
+            return json.loads(path.read_text())
+
+    searched = ", ".join(str(path) for path in candidates)
     if not MANIFEST_PATH.exists():
         raise FileNotFoundError(
-            f"{MANIFEST_PATH} not found — run scripts/01_inspect_model.py first."
+            f"model_manifest.json not found at {searched} — run scripts/01_inspect_model.py first."
         )
-    return json.loads(MANIFEST_PATH.read_text())
+
+
+def coreml_compute_precision(ct):
+    raw = coreml_compute_precision_name()
+    if raw in {"float32", "fp32"}:
+        return ct.precision.FLOAT32
+    if raw in {"float16", "fp16"}:
+        return ct.precision.FLOAT16
+    raise ValueError(
+        "VIBEVOICE_COMPUTE_PRECISION must be float32/fp32 or float16/fp16, "
+        f"got {raw!r}"
+    )
+
+
+def coreml_compute_precision_name() -> str:
+    raw = os.environ.get("VIBEVOICE_COMPUTE_PRECISION", "float32").lower()
+    return raw.replace("-", "").replace("_", "")
+
+
+def parity_tolerance(float32: float, float16: float) -> float:
+    return float16 if coreml_compute_precision_name() in {"float16", "fp16"} else float32
 
 
 def resolve(obj, dotted: str):

@@ -27,7 +27,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
-from _common import OUT_DIR, assert_parity, load_manifest, load_vibevoice  # noqa: E402
+from _common import OUT_DIR, assert_parity, coreml_compute_precision, load_manifest, load_vibevoice, parity_tolerance  # noqa: E402
 
 
 class TTSPrefillWrapper(torch.nn.Module):
@@ -197,7 +197,7 @@ def main() -> int:
             ct.TensorType(name="v_cache"),
         ],
         compute_units=ct.ComputeUnit.CPU_AND_GPU,
-        compute_precision=ct.precision.FLOAT32,
+        compute_precision=coreml_compute_precision(ct),
         minimum_deployment_target=ct.target.iOS18,
         convert_to="mlprogram",
     )
@@ -211,7 +211,12 @@ def main() -> int:
         "tail_mask": ex_tail.numpy(),
         "tts_text_masks": ex_tm.numpy(),
     })
-    assert_parity(py_h, ml_out["hidden_states"], tol=5e-3, label="tts_lm_prefill hidden")
+    assert_parity(
+        py_h,
+        ml_out["hidden_states"],
+        tol=parity_tolerance(float32=5e-3, float16=2e-2),
+        label="tts_lm_prefill hidden",
+    )
 
     # --- Decode -------------------------------------------------------------
     dec = TTSDecodeWrapper(model).eval()
@@ -243,7 +248,7 @@ def main() -> int:
             ct.TensorType(name="v_cache_out"),
         ],
         compute_units=ct.ComputeUnit.CPU_AND_GPU,
-        compute_precision=ct.precision.FLOAT32,
+        compute_precision=coreml_compute_precision(ct),
         minimum_deployment_target=ct.target.iOS18,
         convert_to="mlprogram",
     )

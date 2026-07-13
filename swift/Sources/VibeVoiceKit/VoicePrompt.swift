@@ -9,8 +9,8 @@ import CoreML
 ///   lm, tts_lm, neg_lm, neg_tts_lm
 /// Each branch has: `*_hidden.npy`, `*_k_cache.npy`, `*_v_cache.npy`
 /// Plus a `metadata.json` with sequence lengths.
-public struct VoicePrompt {
-    public struct Branch {
+public struct VoicePrompt: Sendable {
+    public struct Branch: Sendable {
         public let hidden: MLMultiArray    // (1, T, 896)
         public let kCache: MLMultiArray    // (L, 1, KVH, T, D)
         public let vCache: MLMultiArray    // (L, 1, KVH, T, D)

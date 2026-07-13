@@ -14,7 +14,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
-from _common import OUT_DIR, assert_parity, load_manifest, load_vibevoice, resolve  # noqa: E402
+from _common import OUT_DIR, assert_parity, coreml_compute_precision, load_manifest, load_vibevoice, parity_tolerance, resolve  # noqa: E402
 
 
 class DiffusionStepWrapper(torch.nn.Module):
@@ -72,7 +72,7 @@ def main() -> int:
         ],
         outputs=[ct.TensorType(name="predicted_noise")],
         compute_units=ct.ComputeUnit.CPU_AND_GPU,  # fp16 on ANE compounds over 10 steps
-        compute_precision=ct.precision.FLOAT32,
+        compute_precision=coreml_compute_precision(ct),
         minimum_deployment_target=ct.target.iOS18,
         convert_to="mlprogram",
     )
@@ -85,7 +85,12 @@ def main() -> int:
         "timestep": ex_t.numpy(),
         "conditioning": ex_cond.numpy(),
     })
-    assert_parity(py, ml["predicted_noise"], tol=1e-3, label="diffusion step")
+    assert_parity(
+        py,
+        ml["predicted_noise"],
+        tol=parity_tolerance(float32=1e-3, float16=3e-2),
+        label="diffusion step",
+    )
     return 0
 
 

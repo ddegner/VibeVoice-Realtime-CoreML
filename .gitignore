@@ -6,6 +6,7 @@ conversion/**/*.pyc
 swift/.build/
 swift/build/
 swift/.swiftpm/
+swift/bench/listening/
 swift/Package.resolved
 .DS_Store
 *.mlpackage

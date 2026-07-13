@@ -14,7 +14,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
-from _common import OUT_DIR, assert_parity, load_manifest, load_vibevoice, resolve  # noqa: E402
+from _common import OUT_DIR, assert_parity, coreml_compute_precision, load_manifest, load_vibevoice, parity_tolerance, resolve  # noqa: E402
 
 
 class DecoderWrapper(torch.nn.Module):
@@ -55,7 +55,7 @@ def main() -> int:
         inputs=[ct.TensorType(name="latent", shape=(1, D_latent, 16))],
         outputs=[ct.TensorType(name="waveform")],
         compute_units=ct.ComputeUnit.CPU_AND_GPU,
-        compute_precision=ct.precision.FLOAT32,
+        compute_precision=coreml_compute_precision(ct),
         minimum_deployment_target=ct.target.iOS18,
         convert_to="mlprogram",
     )
@@ -64,7 +64,12 @@ def main() -> int:
     with torch.no_grad():
         py = wrapper(ex)
     ml = mlmodel.predict({"latent": ex.numpy()})
-    assert_parity(py, ml["waveform"], tol=1e-2, label="vae decoder")  # looser: convolutions accumulate
+    assert_parity(
+        py,
+        ml["waveform"],
+        tol=parity_tolerance(float32=1e-2, float16=5e-2),
+        label="vae decoder",
+    )  # looser: convolutions accumulate
     return 0
 
 

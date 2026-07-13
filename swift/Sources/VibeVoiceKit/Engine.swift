@@ -9,7 +9,7 @@ import CoreML
 ///   3. Interleaved text-window / speech-window TTS loop with CFG.
 ///   4. Diffusion per frame → acoustic latents.
 ///   5. VAE decoder → 24 kHz PCM.
-public final class VibeVoiceEngine {
+public final class VibeVoiceEngine: @unchecked Sendable {
     /// Identifies a model so per-kind compute-unit overrides can target it.
     public enum ModelKind: Sendable, Hashable {
         case textLM        // text_lm_decode (LM, KV cache, dynamic shape)
@@ -56,6 +56,10 @@ public final class VibeVoiceEngine {
         /// rather than unlocking concurrency. Audio remained bit-identical.
         /// Kept as a knob in case future hardware changes the trade.
         public var ttsHandles: Int = 1
+        /// Benchmark switch: load independent CoreML artifacts concurrently.
+        /// Default stays sequential until load-time and peak-memory behavior is
+        /// measured across supported machines.
+        public var parallelModelLoading: Bool = false
         public init(modelsDir: URL) { self.modelsDir = modelsDir }
     }
 
@@ -86,22 +90,43 @@ public final class VibeVoiceEngine {
         let connectorCfg = cfg(.connector, lowPrecision: config.lowPrecisionAccumForLLMs)
         let eosCfg       = cfg(.eos,       lowPrecision: config.lowPrecisionAccumForLLMs)
 
-        self.tokenizer = try await VibeVoiceTokenizer(modelsDir: config.modelsDir)
-        self.llm = try await LLMRunner(
-            modelsDir: config.modelsDir, textConfig: textCfg, ttsConfig: ttsCfg,
-            ttsHandles: config.ttsHandles)
-        self.diffusion = try await DiffusionRunner(
-            modelURL: config.modelsDir.appendingPathComponent("diffusion_head.mlpackage"),
-            mlConfig: diffCfg,
-            steps: config.diffusionSteps,
-            guidanceScale: config.guidanceScale
-        )
-        self.vae = try await VAERunner(
-            modelURL: config.modelsDir.appendingPathComponent("vae_decoder.mlpackage"),
-            mlConfig: vaeCfg
-        )
-        self.heads = try await HeadsRunner(
-            modelsDir: config.modelsDir, connectorConfig: connectorCfg, eosConfig: eosCfg)
+        if config.parallelModelLoading {
+            async let tokenizerTask = VibeVoiceTokenizer(modelsDir: config.modelsDir)
+            async let llmTask = LLMRunner(
+                modelsDir: config.modelsDir, textConfig: textCfg, ttsConfig: ttsCfg,
+                ttsHandles: config.ttsHandles)
+            async let diffusionTask = DiffusionRunner(
+                modelURL: config.modelsDir.appendingPathComponent("diffusion_head.mlpackage"),
+                mlConfig: diffCfg,
+                steps: config.diffusionSteps,
+                guidanceScale: config.guidanceScale)
+            async let vaeTask = VAERunner(
+                modelURL: config.modelsDir.appendingPathComponent("vae_decoder.mlpackage"),
+                mlConfig: vaeCfg)
+            async let headsTask = HeadsRunner(
+                modelsDir: config.modelsDir, connectorConfig: connectorCfg, eosConfig: eosCfg)
+            let loaded = try await (tokenizerTask, llmTask, diffusionTask, vaeTask, headsTask)
+            self.tokenizer = loaded.0
+            self.llm = loaded.1
+            self.diffusion = loaded.2
+            self.vae = loaded.3
+            self.heads = loaded.4
+        } else {
+            self.tokenizer = try await VibeVoiceTokenizer(modelsDir: config.modelsDir)
+            self.llm = try await LLMRunner(
+                modelsDir: config.modelsDir, textConfig: textCfg, ttsConfig: ttsCfg,
+                ttsHandles: config.ttsHandles)
+            self.diffusion = try await DiffusionRunner(
+                modelURL: config.modelsDir.appendingPathComponent("diffusion_head.mlpackage"),
+                mlConfig: diffCfg,
+                steps: config.diffusionSteps,
+                guidanceScale: config.guidanceScale)
+            self.vae = try await VAERunner(
+                modelURL: config.modelsDir.appendingPathComponent("vae_decoder.mlpackage"),
+                mlConfig: vaeCfg)
+            self.heads = try await HeadsRunner(
+                modelsDir: config.modelsDir, connectorConfig: connectorCfg, eosConfig: eosCfg)
+        }
 
         if config.warmupAtInit {
             // Capture local refs so the async-let tasks don't have to send

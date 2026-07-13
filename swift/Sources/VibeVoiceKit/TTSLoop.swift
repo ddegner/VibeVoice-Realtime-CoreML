@@ -23,7 +23,7 @@ import CoreML
 ///      until EOS fires.
 ///   5. VAE decode in 16-frame windows.
 public final class TTSLoop: @unchecked Sendable {
-    public struct Config {
+    public struct Config: Sendable {
         /// Hard ceiling on speech frames per `generate` call. Each frame is
         /// 3200 audio samples (≈133ms @ 24 kHz), so 1500 ≈ 200s ≈ 3.3 min.
         /// The 0.5B model card advertises up to ~10 min of continuous output;
@@ -91,7 +91,7 @@ public final class TTSLoop: @unchecked Sendable {
     }
 
     /// Per-stage timing breakdown from the last `generate` call.
-    public struct Timing: CustomStringConvertible {
+    public struct Timing: CustomStringConvertible, Sendable {
         public var textLMDecode: Double = 0
         public var ttsLMDecode: Double = 0
         public var diffusion: Double = 0
@@ -129,6 +129,7 @@ public final class TTSLoop: @unchecked Sendable {
     ) async throws -> [Float] {
         var timing = Timing()
         let wallStart = CFAbsoluteTimeGetCurrent()
+        let diffusionSession = try diffusion.makeSession()
 
         // ---- State from voice prompt ----
         var lmK = voicePrompt.lm.kCache
@@ -184,6 +185,32 @@ public final class TTSLoop: @unchecked Sendable {
             textOffset = windowEnd
 
             if !textWindow.isEmpty {
+                if textWindow.count == config.textWindowSize,
+                   textWindow.count == 5,
+                   llm.hasBlockDecode {
+                    let textStarted = CFAbsoluteTimeGetCurrent()
+                    let textStep = try await llm.textDecodeBlock(
+                        inputIDs: textWindow,
+                        kCache: lmK,
+                        vCache: lmV,
+                        positionID: lmPos)
+                    timing.textLMDecode += CFAbsoluteTimeGetCurrent() - textStarted
+                    lmK = textStep.k
+                    lmV = textStep.v
+                    lmPos += Int32(textWindow.count)
+
+                    let ttsStarted = CFAbsoluteTimeGetCurrent()
+                    let ttsStep = try await llm.ttsTextDecodeBlock(
+                        lmHidden: textStep.hidden,
+                        kCache: posK,
+                        vCache: posV,
+                        positionID: posPos)
+                    timing.ttsLMDecode += CFAbsoluteTimeGetCurrent() - ttsStarted
+                    posK = ttsStep.k
+                    posV = ttsStep.v
+                    try lastPositionInto(ttsStep.hidden, dest: posLast)
+                    posPos += Int32(textWindow.count)
+                } else {
                 // Feed each text token through text-LM decode, collecting
                 // per-token hidden states so we can pair them 1:1 with the
                 // TTS-LM steps (upstream feeds the full window's hidden as
@@ -214,6 +241,7 @@ public final class TTSLoop: @unchecked Sendable {
                     try lastPositionInto(posStep.hidden, dest: posLast)
                     posPos += 1
                 }
+                }
             }
 
             // == Speech window: sample up to `speechWindowSize` frames ==
@@ -223,7 +251,8 @@ public final class TTSLoop: @unchecked Sendable {
 
                 // Diffusion sample one frame using CFG
                 let tDiff = CFAbsoluteTimeGetCurrent()
-                let latent = try await diffusion.denoiseFrame(cond: posLast, uncond: negLast)
+                let latent = try await diffusion.denoiseFrame(
+                    cond: posLast, uncond: negLast, session: diffusionSession)
                 try Task.checkCancellation()
                 timing.diffusion += CFAbsoluteTimeGetCurrent() - tDiff
                 allLatents.append(latent)
@@ -278,19 +307,30 @@ public final class TTSLoop: @unchecked Sendable {
                 // `Sendable` values) rather than mutable `var`s, so we snapshot
                 // the K/V caches and positions before spawning the tasks.
                 let tTts = CFAbsoluteTimeGetCurrent()
-                let posKIn = posK, posVIn = posV, posPosIn = posPos
-                let negKIn = negK, negVIn = negV, negPosIn = negPos
-                async let posTask = llm.ttsDecodeStep(
-                    branch: 0,
-                    inputID: 1, lmHidden: acousticEmbed,
-                    tailMask: 1.0, textMask: 0,
-                    kCache: posKIn, vCache: posVIn, positionID: posPosIn)
-                async let negTask = llm.ttsDecodeStep(
-                    branch: 1,
-                    inputID: 1, lmHidden: acousticEmbed,
-                    tailMask: 1.0, textMask: 0,
-                    kCache: negKIn, vCache: negVIn, positionID: negPosIn)
-                let (posStep, negStep) = try await (posTask, negTask)
+                let posStep: (hidden: MLMultiArray, k: MLMultiArray, v: MLMultiArray)
+                let negStep: (hidden: MLMultiArray, k: MLMultiArray, v: MLMultiArray)
+                if llm.hasBatchedCFG {
+                    let batch = try await llm.ttsDecodeCFGStep(
+                        lmHidden: acousticEmbed,
+                        posK: posK, posV: posV, posPosition: posPos,
+                        negK: negK, negV: negV, negPosition: negPos)
+                    posStep = batch.pos
+                    negStep = batch.neg
+                } else {
+                    let posKIn = posK, posVIn = posV, posPosIn = posPos
+                    let negKIn = negK, negVIn = negV, negPosIn = negPos
+                    async let posTask = llm.ttsDecodeStep(
+                        branch: 0,
+                        inputID: 1, lmHidden: acousticEmbed,
+                        tailMask: 1.0, textMask: 0,
+                        kCache: posKIn, vCache: posVIn, positionID: posPosIn)
+                    async let negTask = llm.ttsDecodeStep(
+                        branch: 1,
+                        inputID: 1, lmHidden: acousticEmbed,
+                        tailMask: 1.0, textMask: 0,
+                        kCache: negKIn, vCache: negVIn, positionID: negPosIn)
+                    (posStep, negStep) = try await (posTask, negTask)
+                }
                 try Task.checkCancellation()
                 posK = posStep.k; posV = posStep.v
                 try lastPositionInto(posStep.hidden, dest: posLast)
