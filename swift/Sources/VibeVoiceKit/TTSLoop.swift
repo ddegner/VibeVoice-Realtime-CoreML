@@ -127,9 +127,25 @@ public final class TTSLoop: @unchecked Sendable {
         voicePrompt: VoicePrompt,
         config: Config = Config()
     ) async throws -> [Float] {
+        try await generate(tokens: tokens, voicePrompt: voicePrompt, config: config, seed: nil)
+    }
+
+    /// `seed` overrides the diffusion runner's default seed for this call
+    /// only; `nil` keeps the default from `DiffusionRunner.setSeed`.
+    public func generate(
+        tokens: [Int32],
+        voicePrompt: VoicePrompt,
+        config: Config = Config(),
+        seed: UInt64?
+    ) async throws -> [Float] {
         var timing = Timing()
         let wallStart = CFAbsoluteTimeGetCurrent()
-        let diffusionSession = try diffusion.makeSession()
+        let diffusionSession: DiffusionRunner.Session
+        if let seed {
+            diffusionSession = try diffusion.makeSession(seed: seed)
+        } else {
+            diffusionSession = try diffusion.makeSession()
+        }
 
         // ---- State from voice prompt ----
         var lmK = voicePrompt.lm.kCache

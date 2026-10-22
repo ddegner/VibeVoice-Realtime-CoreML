@@ -133,6 +133,12 @@ public final class DiffusionRunner: @unchecked Sendable {
         return try Session(seed: seed)
     }
 
+    /// A session with an explicit seed, independent of `setSeed`. Lets
+    /// concurrent syntheses use different seeds without sharing state.
+    public func makeSession(seed: UInt64) throws -> Session {
+        try Session(seed: seed)
+    }
+
     public func denoiseFrame(
         cond: MLMultiArray,
         uncond: MLMultiArray,

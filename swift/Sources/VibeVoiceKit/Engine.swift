@@ -154,10 +154,22 @@ public final class VibeVoiceEngine: @unchecked Sendable {
         voicePrompt: VoicePrompt,
         loopConfig: TTSLoop.Config = TTSLoop.Config()
     ) async throws -> (samples: [Float], timing: TTSLoop.Timing) {
+        try await synthesize(text: text, voicePrompt: voicePrompt, loopConfig: loopConfig, seed: nil)
+    }
+
+    /// Synthesize with a diffusion seed that applies to this call only.
+    /// Unlike `setSeed`, concurrent calls with different seeds cannot race on
+    /// the shared default. `nil` uses the engine-wide seed from `setSeed`.
+    public func synthesize(
+        text: String,
+        voicePrompt: VoicePrompt,
+        loopConfig: TTSLoop.Config = TTSLoop.Config(),
+        seed: UInt64?
+    ) async throws -> (samples: [Float], timing: TTSLoop.Timing) {
         let tokens = try tokenizer.encode(text)
         let loop = TTSLoop(llm: llm, diffusion: diffusion, vae: vae, heads: heads)
         let samples = try await loop.generate(
-            tokens: tokens, voicePrompt: voicePrompt, config: loopConfig)
+            tokens: tokens, voicePrompt: voicePrompt, config: loopConfig, seed: seed)
         return (samples, loop.lastTiming)
     }
 
